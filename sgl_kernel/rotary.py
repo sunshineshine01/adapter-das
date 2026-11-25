@@ -219,3 +219,138 @@ def _rotary_embedding_interleaved_torch(positions, query, key, head_size, cos_si
     out_k = _rope(key)
     if out_k is not None:
         key.copy_(out_k)
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-H3 image path: minimax_h3_rotary_embedding
+#
+# Contract source (upstream v0.5.22, vendored in sglang-das):
+#   kernels/aot/csrc/sgl_diffusion/minimax_h3_rope.cu (schema in
+#   kernels/aot/csrc/common_extension_rocm.cc, CUDA-only impl).
+#
+# Community multimodal_gen probes
+# getattr(torch.ops.sgl_kernel, "minimax_h3_rotary_embedding", None) on HCU
+# (DiT dits/minimax_h3.py _apply_rope_qk, VAE vit_utils.py
+# apply_rotary_pos_emb_qk) and hard-fails when the op is absent, so the
+# shadow package must mirror the namespace (kvcacheio torch-op precedent:
+# no routing decision, no env kill-switch, no catalog entry).
+#
+# Torch-composition tier only: rounded_product rounds every product to
+# the input dtype BEFORE the fp32 add/subtract and the final rounding —
+# bit-exact with the eager chain x_rot * cos + rotate_half(x_rot) * sin
+# the kernel was written to match (negation commutes with
+# round-to-nearest-even), so a fused tier needs a node to justify it.
+
+
+def _minimax_h3_rope_torch(positions, query, key, head_size, cos_sin_cache):
+    """Bit-exact torch mirror of the minimax_h3_rope.cu kernel math."""
+    rotary_dim = cos_sin_cache.shape[1]
+    half = rotary_dim // 2
+    tokens, width = query.shape
+    heads = width // head_size
+    # One cache row per token; row = [cos(rd/2) | sin(rd/2)] (cos first).
+    rows = cos_sin_cache.index_select(0, positions).float()  # (T, rotary_dim)
+    cos = rows[:, :half].unsqueeze(1)  # (T, 1, half)
+    sin = rows[:, half:].unsqueeze(1)
+
+    def _rotate(t):
+        packed = t.view(tokens, heads, head_size)  # split of the packed row
+        x = packed[..., :half]
+        y = packed[..., half:rotary_dim]
+        xc = (x.float() * cos).to(t.dtype)  # rounded_product(x, cos)
+        xs = (x.float() * sin).to(t.dtype)
+        yc = (y.float() * cos).to(t.dtype)
+        ys = (y.float() * sin).to(t.dtype)
+        packed[..., :half] = (xc.float() - ys.float()).to(t.dtype)
+        packed[..., half:rotary_dim] = (yc.float() + xs.float()).to(t.dtype)
+
+    _rotate(query)
+    if key is not None:
+        _rotate(key)
+
+
+def minimax_h3_rotary_embedding(
+    positions, query, key, head_size, cos_sin_cache, is_neox=True
+):
+    """Rotate packed MiniMax-H3 Q/K rows in place.
+
+    Mirrors the upstream AOT op: in-place on query (and key when given),
+    one row per token at cache row positions[i], NeoX half-split inside
+    each head's first rotary_dim lanes; lanes [rotary_dim, head_size)
+    pass through untouched.
+    """
+    # Guard order and messages mirror minimax_h3_rope.cu verbatim. The only
+    # dropped clause is the .cu's `query.is_cuda()` device guard: this torch
+    # tier is device-agnostic (the community never calls it with CPU
+    # tensors; HCU device tensors reach it via the CUDA dispatch key).
+    if not is_neox:
+        raise RuntimeError("MiniMax-H3 RoPE requires the NeoX layout")
+    if query.dim() != 2 or query.stride(1) != 1:
+        raise RuntimeError(
+            "MiniMax-H3 RoPE requires packed GPU Q/K with contiguous heads"
+        )
+    if (
+        positions.device != query.device
+        or positions.dtype != torch.int64
+        or positions.dim() != 1
+        or not positions.is_contiguous()
+        or positions.numel() != query.size(0)
+    ):
+        raise RuntimeError(
+            "MiniMax-H3 RoPE requires one GPU int64 position per token"
+        )
+    if head_size <= 0 or query.size(1) <= 0 or query.size(1) % head_size != 0:
+        raise RuntimeError("Invalid MiniMax-H3 attention head size")
+    if (
+        cos_sin_cache.device != query.device
+        or cos_sin_cache.dtype != query.dtype
+        or cos_sin_cache.dim() != 2
+        or not cos_sin_cache.is_contiguous()
+    ):
+        raise RuntimeError(
+            "MiniMax-H3 RoPE cache must have the Q/K device and dtype"
+        )
+    rotary_dim = cos_sin_cache.size(1)
+    if rotary_dim <= 0 or rotary_dim % 2 != 0 or rotary_dim > head_size:
+        raise RuntimeError("Invalid MiniMax-H3 rotary dimension")
+    if key is not None:
+        if (
+            key.device != query.device
+            or key.dtype != query.dtype
+            or key.sizes() != query.sizes()
+            or key.stride(1) != 1
+        ):
+            raise RuntimeError("MiniMax-H3 RoPE requires matching packed Q/K")
+    if query.size(0) == 0:
+        # .cu: the empty-batch return sits AFTER the shape guards and
+        # BEFORE the dtype dispatch (an empty float64 batch is accepted).
+        return
+    if query.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        # DISPATCH_FLOAT_TYPES is redefined by the vendored aot utils.h to
+        # {Float, Half, BFloat16}: float64 is not dispatchable upstream.
+        raise RuntimeError(
+            "minimax_h3_rotary_embedding not implemented for %s" % query.dtype
+        )
+    _minimax_h3_rope_torch(positions, query, key, head_size, cos_sin_cache)
+
+
+_MINIMAX_H3_ROPE_LIB = None  # keep the Library handle alive: GC unregisters its ops
+
+
+def _register_minimax_h3_rope_torch_op() -> None:
+    global _MINIMAX_H3_ROPE_LIB
+    if hasattr(torch.ops.sgl_kernel, "minimax_h3_rotary_embedding"):
+        return
+    lib = torch.library.Library("sgl_kernel", "FRAGMENT")
+    lib.define(
+        "minimax_h3_rotary_embedding(Tensor positions, Tensor! query, "
+        "Tensor!? key, int head_size, Tensor cos_sin_cache, bool is_neox) -> ()"
+    )
+    # CUDA is the key the community's HCU calls dispatch on; the CPU key
+    # keeps the torch.ops seam exercisable on any host (kvcacheio pattern).
+    lib.impl("minimax_h3_rotary_embedding", minimax_h3_rotary_embedding, "CPU")
+    lib.impl("minimax_h3_rotary_embedding", minimax_h3_rotary_embedding, "CUDA")
+    _MINIMAX_H3_ROPE_LIB = lib
+
+
+_register_minimax_h3_rope_torch_op()
