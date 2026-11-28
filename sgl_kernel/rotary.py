@@ -317,7 +317,7 @@ def minimax_h3_rotary_embedding(
         if (
             key.device != query.device
             or key.dtype != query.dtype
-            or key.sizes() != query.sizes()
+            or key.size() != query.size()
             or key.stride(1) != 1
         ):
             raise RuntimeError("MiniMax-H3 RoPE requires matching packed Q/K")
